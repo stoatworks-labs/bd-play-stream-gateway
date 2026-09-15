@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  # The MediaMTX release the rendered configuration is written against. Bump
+  # MediaMTXVersion in render.go at the same time; the check below fails if
+  # the two disagree.
+  MEDIAMTX_VERSION: v1.21.0
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: vet and test
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: the tab script parses
+        run: |
+          sed 's/__BDGW_API_PORT__/8093/g' web/streaming.js > /tmp/streaming.js
+          node --check /tmp/streaming.js
+
+      - name: cross-compile for the PLAY
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags "-s -w" -o dist/bdgw-linux-arm64 .
+          file dist/bdgw-linux-arm64 | grep -q 'ARM aarch64'
+
+      # The renderer emits MediaMTX's own key names, which change between
+      # releases. The only proof that a rendered file is one MediaMTX will
+      # actually load is asking the real binary — so fetch the pinned release,
+      # check its published SHA-256, and run --validate-conf over every fixture
+      # the tests wrote.
+      - name: the pinned version matches render.go
+        run: |
+          grep -q "MediaMTXVersion = \"${MEDIAMTX_VERSION}\"" render.go || {
+            echo "render.go pins a different MediaMTX version than this workflow" >&2; exit 1; }
+
+      - name: fetch MediaMTX ${{ env.MEDIAMTX_VERSION }}
+        run: |
+          set -euo pipefail
+          base="https://github.com/bluenviron/mediamtx/releases/download/${MEDIAMTX_VERSION}"
+          tgz="mediamtx_${MEDIAMTX_VERSION}_linux_amd64.tar.gz"
+          curl -fsSL -o "/tmp/${tgz}" "${base}/${tgz}"
+          curl -fsSL -o /tmp/checksums.sha256 "${base}/checksums.sha256"
+          (cd /tmp && grep " \*\?${tgz}\$" checksums.sha256 | sed 's/\*//' | sha256sum -c -)
+          mkdir -p /tmp/mtx && tar xzf "/tmp/${tgz}" -C /tmp/mtx
+          /tmp/mtx/mediamtx --version
+
+      - name: every rendered fixture validates
+        run: |
+          set -euo pipefail
+          ls testdata/rendered/*.yml
+          for f in testdata/rendered/*.yml; do
+            echo "== $f"
+            /tmp/mtx/mediamtx --validate-conf="$f"
+          done
